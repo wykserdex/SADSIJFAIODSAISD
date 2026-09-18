@@ -1,0 +1,5 @@
+.env
+sessions/
+chats/
+__pycache__/
+*.session
