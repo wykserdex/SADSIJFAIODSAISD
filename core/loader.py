@@ -1,5 +1,6 @@
 """Loader категорий: categories/*/category.py -> (INFO, router, module)."""
 import importlib.util
+import sys
 from pathlib import Path
 
 from aiogram import Router
@@ -7,11 +8,18 @@ from core.base import CategoryInfo
 
 
 def _load_module(cat_id: str, path: Path):
-    spec = importlib.util.spec_from_file_location(f"categories.{cat_id}.category", path)
+    name = f"categories.{cat_id}.category"
+    spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
         raise ImportError(f"no spec for {cat_id}")
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    # в sys.modules до exec: иначе dataclass/pickle/copy в будущих категориях не резолвятся
+    sys.modules[name] = mod
+    try:
+        spec.loader.exec_module(mod)
+    except Exception:
+        sys.modules.pop(name, None)
+        raise
     return mod
 
 

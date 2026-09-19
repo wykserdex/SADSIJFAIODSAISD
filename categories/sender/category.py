@@ -505,21 +505,22 @@ async def _launch(message: types.Message, state: FSMContext, dry_run: bool):
         await message.answer("⚠️ Нет выбранных аккаунтов. Зайди в «👥 Мои аккаунты».")
         return
 
-    accs = [manager.get(n) for n in chosen]
+    # пары имя→объект чтобы прогресс не съезжал после фильтра неавторизованных
+    pairs: list[tuple[str, UserSender]] = [(n, manager.get(n)) for n in chosen]
 
     if not dry_run:
-        valid = []
-        for acc in accs:
+        valid_pairs: list[tuple[str, UserSender]] = []
+        for name, acc in pairs:
             try:
                 await acc.connect()
                 if await acc.is_authorized():
-                    valid.append(acc)
+                    valid_pairs.append((name, acc))
             except Exception:
                 pass
-        if not valid:
+        if not valid_pairs:
             await message.answer("❌ Нет авторизованных аккаунтов среди выбранных.")
             return
-        accs = valid
+        pairs = valid_pairs
 
     uid = message.from_user.id
     if uid in RUNNERS:
@@ -537,7 +538,7 @@ async def _launch(message: types.Message, state: FSMContext, dry_run: bool):
         except Exception:
             pass
 
-    n = len(accs)
+    n = len(pairs)
     shares = [targets[i::n] for i in range(n)]
 
     tag = "🧪 ТЕСТ" if dry_run else "📤"
@@ -546,6 +547,7 @@ async def _launch(message: types.Message, state: FSMContext, dry_run: bool):
     per_acc = {}
     agg = {"sent": 0, "skipped": 0, "failed": 0, "cancelled": 0}
     lock = asyncio.Lock()
+    final_status = "failed"
 
     async def render(note, current):
         async with lock:
@@ -573,21 +575,28 @@ async def _launch(message: types.Message, state: FSMContext, dry_run: bool):
 
     try:
         await asyncio.gather(
-            *(worker(acc, share, chosen[i]) for i, (acc, share) in enumerate(zip(accs, shares)))
+            *(worker(acc, share, name) for (name, acc), share in zip(pairs, shares))
         )
-        final_status = "cancelled" if agg.get("cancelled") else ("completed" if not dry_run else "completed")
+        final_status = "cancelled" if agg.get("cancelled") else "completed"
+        await message.answer(
+            f"{tag} #{campaign_id} Готово!\n✅ Отправлено: {agg['sent']}\n"
+            f"⏭ Пропущено: {agg['skipped']}\n❌ Ошибок: {agg['failed']}\n"
+            f"🛑 Отменено: {agg.get('cancelled', 0)}\n"
+            f"👥 Аккаунтов задействовано: {n}",
+            reply_markup=sender_kb,
+        )
+    except Exception as e:
+        final_status = "failed"
+        try:
+            await message.answer(f"❌ Кампания #{campaign_id} упала: {e}"[:400], reply_markup=sender_kb)
+        except Exception:
+            pass
     finally:
         RUNNERS.pop(uid, None)
-
-    cstore.finish(campaign_id, final_status, sent=agg["sent"], skipped=agg["skipped"], failed=agg["failed"])
-
-    await message.answer(
-        f"{tag} #{campaign_id} Готово!\n✅ Отправлено: {agg['sent']}\n"
-        f"⏭ Пропущено: {agg['skipped']}\n❌ Ошибок: {agg['failed']}\n"
-        f"🛑 Отменено: {agg.get('cancelled', 0)}\n"
-        f"👥 Аккаунтов задействовано: {n}",
-        reply_markup=sender_kb,
-    )
+        try:
+            cstore.finish(campaign_id, final_status, sent=agg["sent"], skipped=agg["skipped"], failed=agg["failed"])
+        except Exception:
+            pass
     await state.set_state(None)
 
 
@@ -648,6 +657,10 @@ async def schedule_set(message: types.Message, state: FSMContext):
         await state.set_state(None)
         return
     data = await state.get_data()
+    if not data.get("chats_path") or not data.get("final_text"):
+        await message.answer("⚠️ Список/текст слетели. Загрузи заново.")
+        await state.set_state(None)
+        return
     await state.set_state(None)
 
     async def _delayed():
@@ -655,13 +668,16 @@ async def schedule_set(message: types.Message, state: FSMContext):
             await asyncio.sleep(mins * 60)
         except asyncio.CancelledError:
             return
-        # запускаем как обычный ран (dry_run из TEST_MODE)
+        # единственная кампания создаётся внутри _launch — пустых записей в истории нет
         await _launch(message, state, dry_run=bool(config.TEST_MODE))
 
     SCHEDULED[uid] = asyncio.create_task(_delayed())
     when = (datetime.now(timezone.utc) + timedelta(minutes=mins)).isoformat(timespec="minutes")
-    cstore.create_campaign(uid, data.get("final_text", ""), [], dry_run=bool(config.TEST_MODE), scheduled_for=when)
-    await message.answer(f"🕒 Запланировал через {mins} мин ({when}). Отмена — 🛑 Остановить.", reply_markup=sender_kb)
+    await message.answer(
+        f"🕒 Запланировал через {mins} мин ({when}).\n"
+        "Запись в истории появится только при фактическом запуске. Отмена — 🛑 Остановить.",
+        reply_markup=sender_kb,
+    )
 
 
 @router.message(F.text == "📊 Sender-статус")
