@@ -58,7 +58,23 @@ def save_settings(data: dict):
     global API_ID, API_HASH, API_CONFIGURED
     API_ID = int(_settings.get("API_ID", "0") or "0")
     API_HASH = _settings.get("API_HASH", "")
-    API_CONFIGURED = bool(API_ID) and bool(API_HASH)
+API_CONFIGURED = bool(API_ID) and bool(API_HASH)
+
+# --- Зеркало: атрибуция ---
+def _read_version() -> str:
+    try:
+        return (Path(__file__).parent / "VERSION").read_text(encoding="utf-8").strip() or "dev"
+    except Exception:
+        return "dev"
+
+VERSION = _read_version()
+# Откуда взят проект (не менять в форках — это исходник)
+SOURCE_URL = _env("SOURCE_URL", "https://github.com/wykserdex/SADSIJFAIODSAISD") or "https://github.com/wykserdex/SADSIJFAIODSAISD"
+# Чей форк: username/ссылка того, у кого взял зеркало. У исходника — пусто.
+FORK_OF = _env("FORK_OF", "")
+# Имя этого зеркала и владелец (показывается в info)
+INSTANCE_NAME = _env("INSTANCE_NAME", "мой мультитул") or "мой мультитул"
+OWNER = _env("OWNER", "")
 
 
 if not BOT_TOKEN:
