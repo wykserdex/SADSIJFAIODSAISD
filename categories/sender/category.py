@@ -1,6 +1,7 @@
-"""Sender-категория: постинг по своей сетке каналов/чатов, где акк — админ."""
+"""Sender-категория: постинг по своей сетке + история/план/стоп в SQLite."""
 import asyncio
 import logging
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from aiogram import Router, types, F
@@ -14,8 +15,9 @@ from aiogram.types import (
 )
 
 import config
+from storage import CampaignStore
 from templates import TEMPLATES, get_template_keyboard
-from user_client import UserSender, parse_lines_to_targets
+from user_client import UserSender, parse_lines_report, parse_lines_to_targets
 from telethon.errors import PhoneCodeExpiredError, PhoneCodeInvalidError, FloodWaitError
 
 INFO = {
@@ -44,6 +46,9 @@ class SessionManager:
 
 
 manager = SessionManager()
+cstore = CampaignStore(config.CAMPAIGNS_DB)
+RUNNERS: dict[int, asyncio.Event] = {}
+SCHEDULED: dict[int, asyncio.Task] = {}
 
 
 class SenderStates(StatesGroup):
@@ -57,6 +62,7 @@ class SenderStates(StatesGroup):
     API_ID_INPUT = State()
     API_HASH_INPUT = State()
     CONFIRM = State()
+    SCHED_MINUTES = State()
 
 
 sender_kb = ReplyKeyboardMarkup(
@@ -67,7 +73,10 @@ sender_kb = ReplyKeyboardMarkup(
         [KeyboardButton(text="📥 Загрузить список чатов")],
         [KeyboardButton(text="✉️ Текст рассылки")],
         [KeyboardButton(text="🚀 Старт рассылки")],
+        [KeyboardButton(text="🕒 Запланировать")],
         [KeyboardButton(text="🧪 Тест-прогон")],
+        [KeyboardButton(text="🛑 Остановить")],
+        [KeyboardButton(text="📜 История")],
         [KeyboardButton(text="📊 Sender-статус")],
         [KeyboardButton(text="⬅️ В категории")],
     ],
@@ -374,10 +383,16 @@ async def process_chats_file(message: types.Message, state: FSMContext):
     # бот-объект получим через message.bot
     path = CHATS_DIR / f"{message.from_user.id}.txt"
     await message.bot.download(doc, destination=path)
-    targets = parse_lines_to_targets(path.read_text(encoding="utf-8", errors="ignore"))
+    raw = path.read_text(encoding="utf-8", errors="ignore")
+    targets, dup, invalid = parse_lines_report(raw)
     await state.update_data(chats_path=str(path), chats_count=len(targets))
+    extra = ""
+    if dup:
+        extra += f" Дубликатов выкинуто: {dup}."
+    if invalid:
+        extra += f" Невалидных строк: {invalid}."
     await message.answer(
-        f"📥 Прочитано ссылок: {len(targets)}.\nТеперь задай текст (кнопка «✉️ Текст рассылки»).",
+        f"📥 Чистых целей: {len(targets)}.{extra}\nТеперь задай текст (кнопка «✉️ Текст рассылки»).",
         reply_markup=sender_kb,
     )
     await state.set_state(None)
@@ -478,11 +493,10 @@ async def _launch(message: types.Message, state: FSMContext, dry_run: bool):
         await message.answer("⚠️ Сначала загрузи список чатов и задай текст.")
         return
 
-    targets = parse_lines_to_targets(
-        Path(chats_path).read_text(encoding="utf-8", errors="ignore")
-    )
+    raw = Path(chats_path).read_text(encoding="utf-8", errors="ignore")
+    targets, dup, invalid = parse_lines_report(raw)
     if not targets:
-        await message.answer("⚠️ Список чатов пуст.")
+        await message.answer("⚠️ Список чатов пуст (после чистки дедупа/невалида).")
         return
 
     chosen = data.get("active_accounts") or manager.all_names()
@@ -507,14 +521,30 @@ async def _launch(message: types.Message, state: FSMContext, dry_run: bool):
             return
         accs = valid
 
+    uid = message.from_user.id
+    if uid in RUNNERS:
+        await message.answer("⚠️ У тебя уже идёт кампания. Жми 🛑 Остановить чтобы прервать.")
+        return
+    stop_event = asyncio.Event()
+    RUNNERS[uid] = stop_event
+
+    campaign_id = cstore.create_campaign(uid, final_text, targets, dry_run=dry_run)
+    cstore.mark_started(campaign_id)
+
+    async def result_cb(target, status: str, error=None):
+        try:
+            cstore.record_target(campaign_id, target, status, error)
+        except Exception:
+            pass
+
     n = len(accs)
     shares = [targets[i::n] for i in range(n)]
 
     tag = "🧪 ТЕСТ" if dry_run else "📤"
     total = len(targets)
-    progress_msg = await message.answer(f"{tag}: подготовка...")
+    progress_msg = await message.answer(f"{tag} #{campaign_id}: подготовка... (стоп — 🛑 Остановить)")
     per_acc = {}
-    agg = {"sent": 0, "skipped": 0, "failed": 0}
+    agg = {"sent": 0, "skipped": 0, "failed": 0, "cancelled": 0}
     lock = asyncio.Lock()
 
     async def render(note, current):
@@ -531,25 +561,107 @@ async def _launch(message: types.Message, state: FSMContext, dry_run: bool):
                 per_acc[acc_name] = idx
             await render(note, f"{acc_name} → {current}")
 
-        stats = await acc.send_to_chats(share, final_text, config.DELAY, cb, dry_run=dry_run)
+        stats = await acc.send_to_chats(
+            share, final_text, config.DELAY, cb,
+            dry_run=dry_run, stop_event=stop_event, result_callback=result_cb,
+        )
         async with lock:
-            agg["sent"] += stats["sent"]
-            agg["skipped"] += stats["skipped"]
-            agg["failed"] += stats["failed"]
+            for k in agg:
+                agg[k] += stats.get(k, 0)
             per_acc[acc_name] = len(share)
         await render(None, f"{acc_name}: финиш")
 
-    await asyncio.gather(
-        *(worker(acc, share, chosen[i]) for i, (acc, share) in enumerate(zip(accs, shares)))
-    )
+    try:
+        await asyncio.gather(
+            *(worker(acc, share, chosen[i]) for i, (acc, share) in enumerate(zip(accs, shares)))
+        )
+        final_status = "cancelled" if agg.get("cancelled") else ("completed" if not dry_run else "completed")
+    finally:
+        RUNNERS.pop(uid, None)
+
+    cstore.finish(campaign_id, final_status, sent=agg["sent"], skipped=agg["skipped"], failed=agg["failed"])
 
     await message.answer(
-        f"{tag} Готово!\n✅ Отправлено: {agg['sent']}\n"
+        f"{tag} #{campaign_id} Готово!\n✅ Отправлено: {agg['sent']}\n"
         f"⏭ Пропущено: {agg['skipped']}\n❌ Ошибок: {agg['failed']}\n"
+        f"🛑 Отменено: {agg.get('cancelled', 0)}\n"
         f"👥 Аккаунтов задействовано: {n}",
         reply_markup=sender_kb,
     )
     await state.set_state(None)
+
+
+@router.message(F.text == "🛑 Остановить")
+async def stop_campaign(message: types.Message, state: FSMContext):
+    uid = message.from_user.id
+    ev = RUNNERS.get(uid)
+    task = SCHEDULED.pop(uid, None)
+    if task and not task.done():
+        task.cancel()
+        await message.answer("🛑 Запланированный запуск отменён.", reply_markup=sender_kb)
+        return
+    if ev is None:
+        await message.answer("Нечего останавливать — активных кампаний нет.", reply_markup=sender_kb)
+        return
+    ev.set()
+    await message.answer("🛑 Останавливаю… текущий чат допишется, остальные встанут.", reply_markup=sender_kb)
+
+
+@router.message(F.text == "📜 История")
+async def history(message: types.Message, state: FSMContext):
+    rows = cstore.recent(message.from_user.id, limit=10)
+    if not rows:
+        await message.answer("📜 Пока пусто.", reply_markup=sender_kb)
+        return
+    lines = ["📜 Последние кампании:"]
+    for r in rows:
+        lines.append(
+            f"#{r['id']} {r['status']}{' 🧪' if r['dry_run'] else ''} "
+            f"всего {r['total']} ✅{r['sent']} ⏭{r['skipped']} ❌{r['failed']} ({r['created_at']})"
+        )
+    await message.answer("\n".join(lines), reply_markup=sender_kb)
+
+
+@router.message(F.text == "🕒 Запланировать")
+async def schedule_ask(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    if not data.get("chats_path") or not data.get("final_text"):
+        await message.answer("⚠️ Сначала загрузи список чатов и задай текст.")
+        return
+    await message.answer(f"Через сколько минут запустить? (1…{config.MAX_SCHEDULE_MINUTES})")
+    await state.set_state(SenderStates.SCHED_MINUTES)
+
+
+@router.message(SenderStates.SCHED_MINUTES)
+async def schedule_set(message: types.Message, state: FSMContext):
+    uid = message.from_user.id
+    try:
+        mins = int((message.text or "").strip())
+    except Exception:
+        await message.answer("❌ Пришли число минут.")
+        return
+    if not 1 <= mins <= config.MAX_SCHEDULE_MINUTES:
+        await message.answer(f"❌ Диапазон 1…{config.MAX_SCHEDULE_MINUTES}.")
+        return
+    if uid in SCHEDULED and not SCHEDULED[uid].done():
+        await message.answer("⚠️ У тебя уже есть запланированный запуск. Сначала 🛑 Остановить.")
+        await state.set_state(None)
+        return
+    data = await state.get_data()
+    await state.set_state(None)
+
+    async def _delayed():
+        try:
+            await asyncio.sleep(mins * 60)
+        except asyncio.CancelledError:
+            return
+        # запускаем как обычный ран (dry_run из TEST_MODE)
+        await _launch(message, state, dry_run=bool(config.TEST_MODE))
+
+    SCHEDULED[uid] = asyncio.create_task(_delayed())
+    when = (datetime.now(timezone.utc) + timedelta(minutes=mins)).isoformat(timespec="minutes")
+    cstore.create_campaign(uid, data.get("final_text", ""), [], dry_run=bool(config.TEST_MODE), scheduled_for=when)
+    await message.answer(f"🕒 Запланировал через {mins} мин ({when}). Отмена — 🛑 Остановить.", reply_markup=sender_kb)
 
 
 @router.message(F.text == "📊 Sender-статус")
