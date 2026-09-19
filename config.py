@@ -1,71 +1,96 @@
 """Конфигурация: .env + settings.json (API-ключи можно вводить прямо в боте)."""
-import os
+from __future__ import annotations
+
 import json
+import os
+import tempfile
 from pathlib import Path
+
 from dotenv import load_dotenv
 
 load_dotenv()
 
-SETTINGS_FILE = Path(__file__).parent / "settings.json"
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(exist_ok=True)
+SETTINGS_FILE = BASE_DIR / "settings.json"
+CAMPAIGNS_DB = DATA_DIR / "campaigns.sqlite3"
 
 
-def _env(key, default=""):
-    """Читаем переменную и сразу обрезаем пробелы/переводы строк (частая причина ошибок)."""
+def _env(key: str, default: str = "") -> str:
+    """Читаем переменную и сразу обрезаем пробелы/переводы строк."""
     return (os.getenv(key) or default).strip()
 
 
-def _load_settings():
+def _safe_int(value: object, default: int) -> int:
     try:
-        with open(SETTINGS_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _load_settings() -> dict:
+    try:
+        with SETTINGS_FILE.open(encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
         return {}
 
 
 _settings = _load_settings()
 
 # .env имеет приоритет над settings.json
-API_ID = int(_env("API_ID") or _settings.get("API_ID") or "0")
-API_HASH = _env("API_HASH") or _settings.get("API_HASH", "")
+API_ID = _safe_int(_env("API_ID") or _settings.get("API_ID"), 0)
+API_HASH = _env("API_HASH") or str(_settings.get("API_HASH", ""))
 BOT_TOKEN = _env("BOT_TOKEN")
-# Пауза между сообщениями (сек). Чем больше — тем безопаснее для аккаунта.
-DELAY = int(_env("DELAY", "10") or "10")
-# Тест-режим: 1 = без реальной отправки (имитация, для проверки флоу).
-TEST_MODE = int(_env("TEST_MODE", "0") or "0")
-# Whitelist: список user_id через запятую. Пусто = доступ у всех (небезопасно!).
+# Пауза не должна быть <1: лимиты Telegram не обходятся.
+DELAY = max(1, _safe_int(_env("DELAY", "10"), 10))
+# Тест-режим: 1 = без реальной отправки.
+TEST_MODE = _safe_int(_env("TEST_MODE", "0"), 0) == 1
+MAX_SCHEDULE_MINUTES = max(1, _safe_int(_env("MAX_SCHEDULE_MINUTES", "1440"), 1440))
+
 ALLOWED_RAW = _env("ALLOWED_USERS")
-def _parse_allowed(raw: str):
-    out = set()
-    for x in raw.split(","):
-        x = x.strip()
-        if not x:
-            continue
+ALLOWED_USERS: set[int] = set()
+for raw_id in ALLOWED_RAW.split(","):
+    raw_id = raw_id.strip()
+    if raw_id:
         try:
-            out.add(int(x))
+            ALLOWED_USERS.add(int(raw_id))
         except ValueError:
-            continue
-    return out
-ALLOWED_USERS = _parse_allowed(ALLOWED_RAW)
+            pass
 
-API_CONFIGURED = bool(API_ID) and bool(API_HASH)
+API_CONFIGURED = bool(API_ID and API_HASH)
 
 
-def save_settings(data: dict):
-    """Сохраняем API-ключи в settings.json и сразу обновляем переменные в рантайме."""
+def save_settings(data: dict) -> None:
+    """Атомарно сохраняет ключи (temp+replace, chmod 600)."""
     _settings.update({k: v for k, v in data.items() if v not in (None, "")})
-    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(_settings, f, indent=2, ensure_ascii=False)
+    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix="settings-", suffix=".json", dir=SETTINGS_FILE.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(_settings, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        os.chmod(temp_name, 0o600)
+        os.replace(temp_name, SETTINGS_FILE)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+
     global API_ID, API_HASH, API_CONFIGURED
-    API_ID = int(_settings.get("API_ID", "0") or "0")
-    API_HASH = _settings.get("API_HASH", "")
-API_CONFIGURED = bool(API_ID) and bool(API_HASH)
+    API_ID = _safe_int(_settings.get("API_ID"), 0)
+    API_HASH = str(_settings.get("API_HASH", ""))
+    API_CONFIGURED = bool(API_ID and API_HASH)
+
 
 # --- Зеркало: атрибуция ---
 def _read_version() -> str:
     try:
-        return (Path(__file__).parent / "VERSION").read_text(encoding="utf-8").strip() or "dev"
+        return (BASE_DIR / "VERSION").read_text(encoding="utf-8").strip() or "dev"
     except Exception:
         return "dev"
+
 
 VERSION = _read_version()
 # Откуда взят проект (не менять в форках — это исходник)

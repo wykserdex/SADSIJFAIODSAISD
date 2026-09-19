@@ -1,42 +1,24 @@
-"""Work-категория: мини таск-менеджер по юзеру. Пример как писать свои категории."""
-import json
-from pathlib import Path
-
+"""Work-категория v2: SQLite-трекер через storage.CampaignStore (по owner_id)."""
 from aiogram import Router, types, F
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
+import config
+from storage import CampaignStore
+
 INFO = {
     "id": "work",
     "title": "🛠 Work",
-    "desc": "Задачи: добавить / список / готово / удалить. Хранится в data/.",
+    "desc": "Задачи в SQLite: добавить / список / готово / удалить.",
 }
 
 router = Router()
-
-DATA_ROOT = Path(__file__).parent.parent.parent / "data"
-DATA_ROOT.mkdir(exist_ok=True)
+store = CampaignStore(config.CAMPAIGNS_DB)
 
 
 class WorkStates(StatesGroup):
     ADD_TEXT = State()
-
-
-def _path(uid: int) -> Path:
-    return DATA_ROOT / f"work_{uid}.json"
-
-
-def _load(uid: int) -> list:
-    p = _path(uid)
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return []
-
-
-def _save(uid: int, items: list):
-    _path(uid).write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _menu() -> InlineKeyboardMarkup:
@@ -48,10 +30,10 @@ def _menu() -> InlineKeyboardMarkup:
 
 async def enter(message: types.Message, state: FSMContext):
     await state.clear()
-    items = _load(message.from_user.id)
-    open_n = sum(1 for t in items if not t.get("done"))
+    items = store.list_tasks(message.from_user.id, limit=100)
+    open_n = sum(1 for t in items if t["status"] == "open")
     await message.answer(
-        f"🛠 Work — открытых: {open_n} / всего: {len(items)}.\nЧто делаем?",
+        f"🛠 Work — открытых: {open_n} / всего: {len(items)} (SQLite).\nЧто делаем?",
         reply_markup=_menu(),
     )
 
@@ -75,50 +57,66 @@ async def on_add_text(message: types.Message, state: FSMContext):
         await state.clear()
         await message.answer("❌ Отмена.", reply_markup=_menu())
         return
-    items = _load(message.from_user.id)
-    items.append({"text": message.text.strip()[:500], "done": False})
-    _save(message.from_user.id, items)
+    store.create_task(message.from_user.id, message.text.strip()[:500])
     await state.clear()
-    await message.answer(f"✅ Добавил. Всего: {len(items)}.", reply_markup=_menu())
+    n = len(store.list_tasks(message.from_user.id, limit=100))
+    await message.answer(f"✅ Добавил. Всего: {n}.", reply_markup=_menu())
 
 
 @router.callback_query(F.data == "work:list")
 async def on_list(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
-    items = _load(callback.from_user.id)
+    items = store.list_tasks(callback.from_user.id, limit=20)
     if not items:
         await callback.message.answer("📭 Пока пусто. Жми «➕ Добавить».", reply_markup=_menu())
         return
     kb = []
     lines = []
-    for i, t in enumerate(items):
-        mark = "✅" if t.get("done") else "⬜"
-        lines.append(f"{i+1}. {mark} {t.get('text','')[:80]}")
-        kb.append([InlineKeyboardButton(
-            text=f"{'↩️' if t.get('done') else '✅'} {i+1}",
-            callback_data=f"work:toggle:{i}",
-        )])
+    for t in items:
+        tid = t["id"]
+        mark = "✅" if t["status"] == "done" else "⬜"
+        lines.append(f"{tid}. {mark} {(t['title'] or '')[:80]}")
+        if t["status"] == "open":
+            kb.append([
+                InlineKeyboardButton(text=f"✅ {tid}", callback_data=f"work:done:{tid}"),
+                InlineKeyboardButton(text=f"🗑 {tid}", callback_data=f"work:del:{tid}"),
+            ])
+        else:
+            kb.append([InlineKeyboardButton(text=f"🗑 {tid}", callback_data=f"work:del:{tid}")])
     kb.append([InlineKeyboardButton(text="🗑 Очистить готовые", callback_data="work:clear_done")])
     await callback.message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
 
-@router.callback_query(F.data.startswith("work:toggle:"))
-async def on_toggle(callback: types.CallbackQuery, state: FSMContext):
+@router.callback_query(F.data.startswith("work:done:"))
+async def on_done(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
     try:
-        idx = int(callback.data.split(":")[2])
+        tid = int(callback.data.split(":")[2])
     except Exception:
         return
-    items = _load(callback.from_user.id)
-    if 0 <= idx < len(items):
-        items[idx]["done"] = not items[idx].get("done")
-        _save(callback.from_user.id, items)
+    store.complete_task(callback.from_user.id, tid)
+    await on_list(callback, state)
+
+
+@router.callback_query(F.data.startswith("work:del:"))
+async def on_del(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    try:
+        tid = int(callback.data.split(":")[2])
+    except Exception:
+        return
+    store.delete_task(callback.from_user.id, tid)
     await on_list(callback, state)
 
 
 @router.callback_query(F.data == "work:clear_done")
 async def on_clear(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
-    items = [t for t in _load(callback.from_user.id) if not t.get("done")]
-    _save(callback.from_user.id, items)
-    await callback.message.answer(f"🗑 Готово. Осталось: {len(items)}.", reply_markup=_menu())
+    items = store.list_tasks(callback.from_user.id, limit=100)
+    n = 0
+    for t in items:
+        if t["status"] == "done":
+            if store.delete_task(callback.from_user.id, t["id"]):
+                n += 1
+    left = len(store.list_tasks(callback.from_user.id, limit=100))
+    await callback.message.answer(f"🗑 Удалил готовых: {n}. Осталось: {left}.", reply_markup=_menu())

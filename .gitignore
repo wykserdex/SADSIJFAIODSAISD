@@ -2,7 +2,10 @@
 settings.json
 sessions/
 chats/
-data/chats/
-data/work_*.json
+data/
+ai_outputs/
 __pycache__/
+*.py[cod]
 *.session
+*.sqlite3
+.pytest_cache/

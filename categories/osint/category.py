@@ -1,4 +1,4 @@
-"""OSINT-safe категория: только свои домены. CT (crt.sh) + DNS. Без людей."""
+"""OSINT-safe v2: свои домены (CT + DNS) + пассивные URL-инструменты с SSRF-гардом. Без людей."""
 import asyncio
 import json
 import re
@@ -12,10 +12,12 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
+from osint_tools import UnsafeTarget, dns_lookup, fetch_headers, url_metadata
+
 INFO = {
     "id": "osint",
     "title": "🔍 OSINT-safe",
-    "desc": "Свои домены: CT-сертификаты + DNS. Людей/почты/ники не ищем.",
+    "desc": "Свои адреса: CT + DNS + заголовки + мета. Приват/люди — в бан.",
 }
 
 router = Router()
@@ -25,6 +27,8 @@ _DOMAIN_RE = re.compile(r"^(?!-)[a-z0-9-]{1,63}(?<!-)(\.(?!-)[a-z0-9-]{1,63}(?<!
 
 class OsintStates(StatesGroup):
     WAIT_DOMAIN = State()
+    WAIT_URL_HEADERS = State()
+    WAIT_URL_META = State()
 
 
 def clean_domain(raw: str) -> str | None:
@@ -123,7 +127,9 @@ async def check_domain(domain: str) -> dict:
 
 def _menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔍 Проверить домен", callback_data="osint:check")],
+        [InlineKeyboardButton(text="🔍 Проверить домен (CT + DNS)", callback_data="osint:check")],
+        [InlineKeyboardButton(text="🧾 Заголовки URL", callback_data="osint:headers")],
+        [InlineKeyboardButton(text="🔗 Мета URL", callback_data="osint:meta")],
         [InlineKeyboardButton(text="ℹ️ Что умею", callback_data="osint:about")],
     ])
 
@@ -131,8 +137,9 @@ def _menu() -> InlineKeyboardMarkup:
 async def enter(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(
-        "🔍 OSINT-safe — только свои домены.\n"
-        "Умею: CT (crt.sh) + DNS. Не ищу людей, почты, ники, телефоны.",
+        "🔍 OSINT-safe — только свои публичные адреса.\n"
+        "Умею: CT + DNS по домену, заголовки и мета по URL. "
+        "Приватные сети, localhost, людей/почты/ники — отклоняю.",
         reply_markup=_menu(),
     )
 
@@ -147,11 +154,11 @@ async def on_enter(callback: types.CallbackQuery, state: FSMContext):
 async def on_about(callback: types.CallbackQuery):
     await callback.answer()
     await callback.message.answer(
-        "🔍 Проверяю домен:\n"
-        "• crt.sh — сколько сертов, имена, издатели, просрочки\n"
-        "• DNS — A-записи\n\n"
-        "Вставь именно домен: example.com\n"
-        "Email / @nick / телефон — отклоню, это не мой профиль."
+        "🔍 Проверяю:\n"
+        "• домен: crt.sh (серты/имена/просрочки) + DNS\n"
+        "• URL: HTTP-заголовки и title/description\n\n"
+        "Вставь домен (example.com) или URL (https://example.com).\n"
+        "Приватные IP, localhost, почты/ники/телефоны — отклоню."
     )
 
 
@@ -194,3 +201,47 @@ async def on_domain(message: types.Message, state: FSMContext):
         ips = ", ".join(dns.get("ips", [])[:5]) or "—"
         lines.append(f"DNS: {ips}")
     await wait.edit_text("\n".join(lines)[:3500], reply_markup=_menu())
+
+
+@router.callback_query(F.data == "osint:headers")
+async def on_headers(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.set_state(OsintStates.WAIT_URL_HEADERS)
+    await callback.message.answer("Пришли публичный URL (https://example.com):")
+
+
+@router.callback_query(F.data == "osint:meta")
+async def on_meta(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.set_state(OsintStates.WAIT_URL_META)
+    await callback.message.answer("Пришли публичный URL (https://example.com):")
+
+
+@router.message(OsintStates.WAIT_URL_HEADERS)
+async def on_url_headers(message: types.Message, state: FSMContext):
+    await state.clear()
+    wait = await message.answer("🧾 Читаю заголовки …")
+    try:
+        text = await asyncio.wait_for(fetch_headers(message.text or ""), timeout=20)
+    except UnsafeTarget as e:
+        await wait.edit_text(f"⛔ Отклонено: {e}")
+        return
+    except Exception as e:
+        await wait.edit_text(f"❌ Ошибка: {e}"[:400])
+        return
+    await wait.edit_text(text[:3500], reply_markup=_menu())
+
+
+@router.message(OsintStates.WAIT_URL_META)
+async def on_url_meta(message: types.Message, state: FSMContext):
+    await state.clear()
+    wait = await message.answer("🔗 Читаю мета …")
+    try:
+        text = await asyncio.wait_for(url_metadata(message.text or ""), timeout=25)
+    except UnsafeTarget as e:
+        await wait.edit_text(f"⛔ Отклонено: {e}")
+        return
+    except Exception as e:
+        await wait.edit_text(f"❌ Ошибка: {e}"[:400])
+        return
+    await wait.edit_text(text[:3500], reply_markup=_menu())
