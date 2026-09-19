@@ -94,14 +94,12 @@ class UserSender:
     def parse_lines_to_targets(self, text):
         return parse_lines_to_targets(text)
 
-    # ---------- отправка ----------
+    # ---------- отправка (только своя сетка: чужие чаты уходят в skipped) ----------
     async def _resolve(self, kind, value):
         if kind == "invite":
-            try:
-                return await self.client.get_entity("https://t.me/+" + value)
-            except Exception:
-                await self.client.join_chat(value)
-                return await self.client.get_entity("https://t.me/+" + value)
+            # invite-ссылки: не джойнимся в чужие чаты автоматом.
+            # Для своей сетки добавь бота/акк заранее руками, сюда кидай username/id.
+            return await self.client.get_entity("https://t.me/+" + value)
         return await self.client.get_entity(value)
 
     async def _safe_send(self, entity, text):

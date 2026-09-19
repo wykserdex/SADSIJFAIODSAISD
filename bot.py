@@ -1,4 +1,4 @@
-"""aiogram-бот — управляющий интерфейс для рассылки (мультиаккаунт + whitelist)."""
+"""aiogram-бот — управляющий интерфейс для постинга по своей сетке каналов/чатов."""
 import asyncio
 import logging
 from pathlib import Path
@@ -224,8 +224,11 @@ async def process_acc_name(message: types.Message, state: FSMContext):
 async def process_phone(message: types.Message, state: FSMContext):
     if message.contact:
         phone = "+" + message.contact.phone_number.lstrip("+")
-    else:
+    elif message.text:
         phone = message.text.strip()
+    else:
+        await message.answer("Пришли номер текстом или кнопкой «📱 Поделиться номером».")
+        return
     if not phone.startswith("+"):
         phone = "+" + phone
 
@@ -235,7 +238,8 @@ async def process_phone(message: types.Message, state: FSMContext):
     await state.update_data(phone=phone)
     try:
         await acc.connect()
-        await acc.send_code(phone)
+        phone_hash = await acc.send_code(phone)
+        await state.update_data(phone_code_hash=phone_hash)
     except Exception as e:
         await message.answer(f"❌ Ошибка отправки кода: {e}")
         return
@@ -248,6 +252,9 @@ async def process_phone(message: types.Message, state: FSMContext):
 
 @dp.message(States.CODE)
 async def process_code(message: types.Message, state: FSMContext):
+    if not message.text:
+        await message.answer("Пришли код текстом:")
+        return
     code = message.text.strip()
     data = await state.get_data()
     name = data["acc_name"]
@@ -425,9 +432,9 @@ async def process_message_text(message: types.Message, state: FSMContext):
     await state.set_state(States.MENU)
 
 
-# ---------------- запуск рассылки (параллельно по аккаунтам) ----------------
+# ---------------- запуск рассылки (только по своим каналам/чатам) ----------------
 @dp.message(F.text == "🚀 Старт рассылки")
-async def start_sending(me, state: FSMContext):
+async def start_sending(message: types.Message, state: FSMContext):
     data = await state.get_data()
     if not data.get("chats_path") or not data.get("final_text"):
         await message.answer("⚠️ Сначала загрузи список чатов и задай текст.")
@@ -577,8 +584,8 @@ async def status(message: types.Message, state: FSMContext):
     await message.answer("\n".join(lines), reply_markup=main_kb)
 
 
-# ---------------- фолбэк: в ЛС бот никогда не молчит ----------------
-@dp.message(F.chat.type == "private")
+# ---------------- фолбэк: в ЛС бот никогда не молчит (только в MENU, чтобы не рвать ввод кода/номера) ----------------
+@dp.message(F.chat.type == "private", States.MENU)
 async def fallback_private(message: types.Message, state: FSMContext):
     await state.set_state(States.MENU)
     await message.answer(

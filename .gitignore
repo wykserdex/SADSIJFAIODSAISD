@@ -1,4 +1,5 @@
 .env
+settings.json
 sessions/
 chats/
 __pycache__/

@@ -34,7 +34,18 @@ DELAY = int(_env("DELAY", "10") or "10")
 TEST_MODE = int(_env("TEST_MODE", "0") or "0")
 # Whitelist: список user_id через запятую. Пусто = доступ у всех (небезопасно!).
 ALLOWED_RAW = _env("ALLOWED_USERS")
-ALLOWED_USERS = {int(x) for x in ALLOWED_RAW.split(",") if x.strip()}
+def _parse_allowed(raw: str):
+    out = set()
+    for x in raw.split(","):
+        x = x.strip()
+        if not x:
+            continue
+        try:
+            out.add(int(x))
+        except ValueError:
+            continue
+    return out
+ALLOWED_USERS = _parse_allowed(ALLOWED_RAW)
 
 API_CONFIGURED = bool(API_ID) and bool(API_HASH)
 
